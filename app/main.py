@@ -23,11 +23,18 @@ from .model import (
     extract_forest,
     train_model,
 )
+from .attribution import compute_attribution
 from .samples import build_samples
 from .solver import SolveInput, solve
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+
+# 归因演示样例：调整前不合格、调整后合格的整数配方（总重均 1000 克）。
+ATTRIBUTION_SAMPLE = {
+    "original": [250, 250, 350, 150],
+    "adjusted": [390, 250, 210, 150],
+}
 
 app = FastAPI(title="再生塑料配方试配筛选", version="1.0.0")
 
@@ -98,9 +105,46 @@ def api_samples() -> dict:
     return SAMPLES
 
 
+def _as_int_list(payload: dict, key: str) -> list:
+    """宽松解析整数数组：整数值的 float 转为 int，其余原样留给校验拒绝。"""
+    v = payload.get(key)
+    if not isinstance(v, (list, tuple)):
+        return []
+    out = []
+    for x in v:
+        if isinstance(x, bool):
+            out.append(x)  # 校验阶段会拒绝
+        elif isinstance(x, int):
+            out.append(x)
+        elif isinstance(x, float) and x.is_integer():
+            out.append(int(x))
+        else:
+            out.append(x)  # 原样传入，由校验报错
+    return out
+
+
+@app.post("/api/attribution")
+def api_attribution(payload: dict) -> dict:
+    # 任何字段缺失/类型错误都落到 []，由 validate_pair 判为 invalid（不出报告）。
+    result = compute_attribution(
+        CLF, _as_int_list(payload, "original"), _as_int_list(payload, "adjusted")
+    )
+    return result.to_dict()
+
+
+@app.get("/api/attribution/sample")
+def api_attribution_sample() -> dict:
+    return ATTRIBUTION_SAMPLE
+
+
 @app.get("/", include_in_schema=False)
 def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/attribution", include_in_schema=False)
+def attribution_page():
+    return FileResponse(STATIC_DIR / "attribution.html")
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

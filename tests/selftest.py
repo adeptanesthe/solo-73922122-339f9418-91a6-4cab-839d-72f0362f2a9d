@@ -12,17 +12,31 @@
  5. 字典序：改 2 种（量大）与改 3 种（量小）并存时，必须返回改 2 种；
  6. 边界：原配方已合格（0 改动）、全锁定合格/不合格、各类非法输入；
  7. 求解失败路径：异常注入返回 solver_failure 而非无解；
- 8. API：/、/api/meta、/api/samples、/api/solve 各状态分支；页面含迟到结果丢弃逻辑。
+ 8. API：/、/api/meta、/api/samples、/api/solve 各状态分支；页面含迟到结果丢弃逻辑；
+ 9. 归因：中间配方构造规则（按比例补齐、最大余数、参考为零时均分）、
+    Shapley 值与直接按定义穷举一致、效率性（贡献和 = 概率差）、
+    非法输入不出报告、API 分支、归因页含迟到结果丢弃逻辑。
 """
 from __future__ import annotations
 
 import itertools
+import math
 import sys
 
 import numpy as np
 import z3
 
+from app.attribution import (
+    INTERNAL_ERROR,
+    INVALID as ATTR_INVALID,
+    OK as ATTR_OK,
+    compute_attribution,
+    fill_intermediate,
+    shapley_values,
+    validate_pair,
+)
 from app.model import (
+    FEATURE_NAMES,
     MAX_DEPTH,
     N_TREES,
     TOTAL_GRAMS,
@@ -248,6 +262,175 @@ def main():
     check("POST /api/solve 非法输入分支", r.json()["status"] == "invalid")
     html = client.get("/").text
     check("页面含迟到结果丢弃逻辑", "my !== epoch" in html and "abort" in html)
+
+    print("== 9. 归因 ==")
+    from app.attribution import fill_intermediate as _fill
+
+    # 9a. 中间配方构造规则
+    orig_f = [250, 250, 350, 150]
+    adj_f = [390, 250, 210, 150]
+    ok_rule = True
+    detail = ""
+    for mask in range(1 << 4):
+        z = _fill(orig_f, adj_f, mask)
+        if any(v < 0 or not isinstance(v, int) for v in z) or sum(z) != TOTAL_GRAMS:
+            ok_rule = False; detail = f"mask={mask} z={z}"
+            break
+        for i in range(4):
+            if mask & (1 << i) and z[i] != adj_f[i]:
+                ok_rule = False; detail = f"mask={mask} 固定项未取调整后用量"
+    check("16 份中间配方非负、总重 1000、固定项取调整后用量", ok_rule, detail)
+    check("空集子集 = 调整前配方", _fill(orig_f, adj_f, 0) == orig_f)
+    check("全集子集 = 调整后配方", _fill(orig_f, adj_f, 0b1111) == adj_f)
+
+    # 比例补齐：子集 {0} 时其余按 250:350:150 补 610 克 → 203/285/122（最大余数法）
+    check("按原配方比例补齐（最大余数法）", _fill(orig_f, adj_f, 0b0001) == [390, 203, 285, 122],
+          str(_fill(orig_f, adj_f, 0b0001)))
+    # 参考量为 0 的原料不得余克：参考 [0,1,1] 分 1 克 → 精确 0/0.5/0.5，余克给下标 1
+    check("参考量为 0 的原料不会分到余克",
+          _fill([0, 1, 1, 998], [0, 0, 0, 999], 0b1000) == [0, 1, 0, 999],
+          str(_fill([0, 1, 1, 998], [0, 0, 0, 999], 0b1000)))
+    # 余量并列时下标靠前者优先：参考 [1,1,2] 分 2 克 → 精确 0.5/0.5/1，余克给下标 0
+    check("最大余数并列时下标靠前者优先",
+          _fill([1, 1, 2, 996], [0, 0, 0, 998], 0b1000) == [1, 0, 1, 998],
+          str(_fill([1, 1, 2, 996], [0, 0, 0, 998], 0b1000)))
+    # 参考剩余量全为零：补集均分剩余量（1000/3 → 334,333,333，余克按下标从小到大）
+    check("参考剩余量全为零时均分并按下标分配余克",
+          _fill([0, 0, 0, 1000], [333, 333, 334, 0], 0b1000) == [334, 333, 333, 0],
+          str(_fill([0, 0, 0, 1000], [333, 333, 334, 0], 0b1000)))
+    check("参考剩余量全为零且可整除时均分",
+          _fill([0, 0, 0, 1000], [100, 100, 100, 700], 0b1000) == [100, 100, 100, 700],
+          str(_fill([0, 0, 0, 1000], [100, 100, 100, 700], 0b1000)))
+
+    # 9b. Shapley 值与按定义穷举一致
+    vals = [float(forest_proba_rational(forest, _fill(orig_f, adj_f, m)))
+            for m in range(16)]
+    phi_mod = shapley_values(vals)
+    phi_ref = []
+    for i in range(4):
+        others = [j for j in range(4) if j != i]
+        acc = 0.0
+        for k in range(4):
+            for S in itertools.combinations(others, k):
+                mask = sum(1 << j for j in S)
+                w = math.factorial(k) * math.factorial(4 - k - 1) / math.factorial(4)
+                acc += w * (vals[mask | (1 << i)] - vals[mask])
+        phi_ref.append(acc)
+    check("Shapley 值按定义穷举一致", all(abs(a - b) < 1e-12 for a, b in zip(phi_mod, phi_ref)))
+
+    # 9c. 完整归因：效率性 + 报告字段 + 原分类器复算一致
+    attr = compute_attribution(clf, orig_f, adj_f)
+    check("归因返回 ok", attr.status == ATTR_OK, attr.reason)
+    check("两端概率与原分类器一致",
+          abs(attr.original_probability - predict_proba_qualified(clf, orig_f)) < 1e-12
+          and abs(attr.adjusted_probability - predict_proba_qualified(clf, adj_f)) < 1e-12)
+    check("贡献和 = 实际概率差（效率性，误差 < 1e-12）",
+          abs(attr.contribution_sum - attr.difference) < 1e-12,
+          f"sum={attr.contribution_sum}, diff={attr.difference}")
+    check("误差字段 = 贡献和 − 概率差",
+          abs(attr.error - (attr.contribution_sum - attr.difference)) < 1e-15)
+    check("贡献项齐全且含名称与正负号",
+          [c["name"] for c in attr.contributions] == FEATURE_NAMES
+          and any(c["contribution"] > 0 for c in attr.contributions))
+    pri = attr.priority_index
+    check("优先复核项为 |贡献| 最大者",
+          abs(attr.contributions[pri]["contribution"]) ==
+          max(abs(c["contribution"]) for c in attr.contributions))
+    check("16 份中间配方全部列出", len(attr.intermediates) == 16)
+
+    # 9c-2. 随机 60 组配方：构造规则 + 效率性 + 与原分类器一致
+    rng_attr = np.random.default_rng(20241118)
+    prop_ok = True
+    prop_detail = ""
+    for _ in range(60):
+        o = rng_attr.multinomial(TOTAL_GRAMS, [0.3, 0.25, 0.3, 0.15]).tolist()
+        a = rng_attr.multinomial(TOTAL_GRAMS, [0.35, 0.2, 0.25, 0.2]).tolist()
+        for m in range(16):
+            z = _fill(o, a, m)
+            if sum(z) != TOTAL_GRAMS or any(v < 0 for v in z):
+                prop_ok = False; prop_detail = f"o={o} a={a} m={m} z={z}"
+        ra = compute_attribution(clf, o, a)
+        if (ra.status != ATTR_OK or float(np.sum([c["contribution"] for c in ra.contributions]))
+                != ra.contribution_sum or abs(ra.contribution_sum - ra.difference) > 1e-12
+                or abs(ra.original_probability - predict_proba_qualified(clf, o)) > 1e-12
+                or abs(ra.adjusted_probability - predict_proba_qualified(clf, a)) > 1e-12):
+            prop_ok = False; prop_detail = f"o={o} a={a}"
+        if not prop_ok:
+            break
+    check("随机 60 组配方：中间配方合法且效率性/两端概率成立", prop_ok, prop_detail)
+
+    # 9c-3. 任意参考配方（含大量零项）也满足构造规则
+    zero_ok = True
+    for _ in range(60):
+        o = rng_attr.multinomial(TOTAL_GRAMS, [0.7, 0.1, 0.1, 0.1]).tolist()
+        a = rng_attr.multinomial(TOTAL_GRAMS, [0.1, 0.1, 0.1, 0.7]).tolist()
+        for m in range(16):
+            z = _fill(o, a, m)
+            if sum(z) != TOTAL_GRAMS or any(v < 0 for v in z):
+                zero_ok = False
+    check("随机 60 组偏斜参考配方：中间配方非负且总重 1000", zero_ok)
+
+    # 9d. 调整前后互换：补齐基准随之改变，故贡献不要求取反；仍需满足效率性。
+    rev = compute_attribution(clf, adj_f, orig_f)
+    check("调整前后互换后仍返回 ok 且效率性成立",
+          rev.status == ATTR_OK and abs(rev.contribution_sum - rev.difference) < 1e-12)
+    check("调整前后互换后优先复核项为 |贡献| 最大者",
+          abs(rev.contributions[rev.priority_index]["contribution"]) ==
+          max(abs(c["contribution"]) for c in rev.contributions))
+
+    # 9e. 非法输入：不出报告（状态 invalid，且序列化后不含报告字段）
+    bad_pairs = [
+        ([250, 250, 350, 149], adj_f),          # 总重 999
+        (orig_f, [390, 250, 210, 151]),         # 总重 1001
+        ([250, 250, 350], adj_f),               # 长度 3
+        ([250, 250, 350, 150.0], adj_f),        # 浮点
+        ([250, 250, 350, True], adj_f),         # 布尔
+        ([250, 250, 350, -150], adj_f),         # 负数
+        ([250, 250, 350, 1150], adj_f),         # 单项 > 1000
+        (None, adj_f),
+    ]
+    bad_ok = True
+    for o, a in bad_pairs:
+        r = compute_attribution(clf, o if o is not None else [], a)
+        d = r.to_dict()
+        if r.status != ATTR_INVALID or set(d.keys()) != {"status", "reason"}:
+            bad_ok = False
+            print("   failed pair:", o, a, "->", r.status, d.keys())
+    check("非法输入均判 invalid 且不携带报告字段", bad_ok)
+
+    # 9f. 计算异常与非法输入区分（注入异常）
+    import app.attribution as at
+    orig_predict = at.predict_proba_qualified
+    at.predict_proba_qualified = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected"))
+    try:
+        r_boom = compute_attribution(clf, orig_f, adj_f)
+    finally:
+        at.predict_proba_qualified = orig_predict
+    check("计算异常 → internal_error（非 invalid）", r_boom.status == INTERNAL_ERROR
+          and set(r_boom.to_dict().keys()) == {"status", "reason"})
+
+    # 9g. API 分支
+    r = client.post("/api/attribution", json={"original": orig_f, "adjusted": adj_f})
+    aj = r.json()
+    check("POST /api/attribution 正常分支", r.status_code == 200 and aj["status"] == "ok"
+          and len(aj["contributions"]) == 4 and abs(aj["error"]) < 1e-12)
+    r = client.post("/api/attribution", json={"original": [1, 2, 3, 4], "adjusted": adj_f})
+    check("POST /api/attribution 非法分支不出报告",
+          r.json()["status"] == "invalid" and "contributions" not in r.json())
+    r = client.post("/api/attribution", json={})
+    check("POST /api/attribution 缺字段判 invalid", r.json()["status"] == "invalid")
+    r = client.post("/api/attribution", json={"original": [250.0, 250.0, 350.0, 150.0],
+                                              "adjusted": adj_f})
+    check("POST /api/attribution 整数值浮点被接受", r.json()["status"] == "ok")
+    r = client.get("/attribution")
+    check("GET /attribution 返回归因页", r.status_code == 200 and "计算归因" in r.text)
+    ah = client.get("/attribution").text
+    check("归因页含迟到结果丢弃逻辑", "my !== epoch" in ah and "abort" in ah)
+    check("归因页不渲染非 ok 报告", "d.status !== \"ok\"" in ah)
+    r = client.get("/api/attribution/sample")
+    check("GET /api/attribution/sample",
+          validate_pair(r.json()["original"], r.json()["adjusted"]) == [])
+    check("归因页导航回原试配", 'href="/"' in ah)
 
     print()
     if failures:

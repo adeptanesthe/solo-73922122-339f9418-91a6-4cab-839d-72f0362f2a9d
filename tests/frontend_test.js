@@ -1,39 +1,12 @@
-// 前端撤回逻辑功能测试：DOM 打桩 + 可控 fetch，验证
+// 试配页前端撤回逻辑功能测试：DOM 打桩 + 可控 fetch，执行页面真实脚本，验证
 //  1) 求解期间修改输入 → 旧建议立即撤下（结果区清空）
 //  2) 迟到的旧响应即使成功返回也绝不恢复显示
 //  3) 正常求解 → 结果正常渲染
-const fs = require('fs');
-const path = require('path');
-const html = fs.readFileSync(path.join(__dirname, '..', 'app', 'static', 'index.html'), 'utf8');
-const pageJs = html.match(/<script>([\s\S]*)<\/script>/)[1];
+const { loadPage, installDom, makeAssert } = require('./dom_harness');
 
-// ---- DOM 打桩 ----
-const store = {};
-function el(id) {
-  if (!store[id]) {
-    const e = {
-      id, checked: false, textContent: '', innerHTML: '',
-      style: { display: 'none' }, dataset: {}, disabled: false,
-      listeners: {},
-      classList: { add() {}, remove() {} },
-      addEventListener(ev, fn) { (this.listeners[ev] ??= []).push(fn); },
-      appendChild() {},
-    };
-    let v = '0';
-    Object.defineProperty(e, 'value', {   // 真实 DOM 中 input.value 恒为字符串
-      get: () => v, set: x => { v = String(x); },
-    });
-    store[id] = e;
-  }
-  return store[id];
-}
-global.document = {
-  getElementById: el,
-  querySelector: () => el('tbody'),
-  createElement: () => el('tr_' + Math.random()),
-};
-let fetchImpl = () => Promise.reject(new Error('fetch not stubbed'));
-global.fetch = (...a) => fetchImpl(...a);
+const { js: pageJs } = loadPage('index.html');
+installDom();
+const assert = makeAssert();
 
 const META = { feature_names: ['A','B','C','D'], total_grams: 1000, proba_threshold: 0.7,
   n_trees: 5, max_depth: 3, tree_depths: [3,3,3,3,3], train_seed: 1 };
@@ -49,22 +22,24 @@ const OK_RESULT = { status: 'ok', suggestion: [390,250,210,150], probability: 0.
     { name:'C', original:350, new:210, delta:-140, locked:false },
     { name:'D', original:150, new:150, delta:0, locked:false } ] };
 
-// boot 在 eval 时同步发起 fetch，须提前打桩
-fetchImpl = url => Promise.resolve({ json: async () => url.includes('meta') ? META : SAMPLES });
+// 页面脚本以全局 fetch 发起请求；所有请求经由 fetchImpl（场景中可替换）。
+let fetchImpl = url => Promise.resolve({ json: async () => url.includes('meta') ? META : SAMPLES });
+global.fetch = (url, opts) => fetchImpl(url, opts);
 
 const driver = `
 (async () => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const assert = (name, cond) => { console.log((cond ? '[PASS] ' : '[FAIL] ') + name); if (!cond) process.exitCode = 1; };
+  const $ = id => document.getElementById(id);
+  const assert = ${assert.toString()};
 
   await sleep(20);
-  assert('启动后载入可行样例', document.getElementById('orig0').value == 250);
+  assert('启动后载入可行样例', $('orig0').value == 250);
 
   // --- 场景 1：正常求解渲染 ---
   fetchImpl = () => Promise.resolve({ json: async () => OK_RESULT });
   await solve();
-  assert('正常求解后 ok 面板显示', document.getElementById('panelOk').style.display === 'block');
-  assert('概率已渲染', document.getElementById('okProb').textContent.includes('79.69'));
+  assert('正常求解后 ok 面板显示', $('panelOk').style.display === 'block');
+  assert('概率已渲染', $('okProb').textContent.includes('79.69'));
 
   // --- 场景 2：求解期间修改 → 立即撤下；迟到结果不恢复 ---
   let resolveStale;
@@ -72,24 +47,24 @@ const driver = `
   const p = solve();                 // 发起求解（不等待）
   await sleep(5);
   onUserEdit();                      // 用户修改输入
-  assert('修改后旧建议立即撤下', document.getElementById('panelOk').style.display === 'none');
-  assert('状态提示已撤下', document.getElementById('status').textContent.includes('撤下'));
+  assert('修改后旧建议立即撤下', $('panelOk').style.display === 'none');
+  assert('状态提示已撤下', $('status').textContent.includes('撤下'));
   resolveStale();                    // 迟到响应“绕过”abort 成功返回（竞态）
   await p;
   await sleep(5);
-  assert('迟到结果未恢复 ok 面板', document.getElementById('panelOk').style.display === 'none');
-  assert('迟到结果未改写状态', document.getElementById('status').textContent.includes('撤下'));
+  assert('迟到结果未恢复 ok 面板', $('panelOk').style.display === 'none');
+  assert('迟到结果未改写状态', $('status').textContent.includes('撤下'));
 
   // --- 场景 3：撤下后重新求解仍正常 ---
   fetchImpl = () => Promise.resolve({ json: async () => OK_RESULT });
   await solve();
-  assert('重新求解后 ok 面板恢复', document.getElementById('panelOk').style.display === 'block');
+  assert('重新求解后 ok 面板恢复', $('panelOk').style.display === 'block');
 
   // --- 场景 4：无解分支渲染 ---
   fetchImpl = () => Promise.resolve({ json: async () => ({ status: 'infeasible', reason: '已证明无解', solve_ms: 30 }) });
   await solve();
-  assert('无解面板显示', document.getElementById('panelInfeasible').style.display === 'block');
-  assert('ok 面板保持隐藏', document.getElementById('panelOk').style.display === 'none');
+  assert('无解面板显示', $('panelInfeasible').style.display === 'block');
+  assert('ok 面板保持隐藏', $('panelOk').style.display === 'none');
 })();
 `;
 

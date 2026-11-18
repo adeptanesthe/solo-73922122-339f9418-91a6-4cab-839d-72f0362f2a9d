@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>合格概率归因（Shapley）</title>
+<style>
+  :root { --ink:#1f2933; --muted:#6b7280; --line:#d8dee6; --ok:#0f7b3d; --bad:#b42318; --warn:#9a6700; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif; color:var(--ink); background:var(--bg); }
+  header { background:#0b3d2e; color:#fff; padding:14px 22px; }
+  header h1 { margin:0; font-size:19px; }
+  header p { margin:4px 0 0; font-size:12.5px; opacity:.85; }
+  header nav { margin-top:8px; font-size:12.5px; }
+  header nav a { color:#c9e8d9; text-decoration:none; border-bottom:1px dotted #c9e8d966; }
+  header nav a:hover { color:#fff; }
+  main { max-width: 980px; margin: 18px auto 60px; padding: 0 16px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  table { border-collapse: collapse; width:100%; }
+  th, td { padding:7px 8px; text-align:center; font-size:13.5px; }
+  th { color:var(--muted); font-weight:600; border-bottom:2px solid var(--line); }
+  td { border-bottom:1px solid #eef1f4; }
+  input[type=number] { width:92px; padding:5px 6px; border:1px solid var(--line); border-radius:6px; font-size:13.5px; text-align:right; }
+  input[type=number]:focus { outline:2px solid #0b3d2e33; border-color:#0b3d2e; }
+  input.invalid { outline:2px solid #b4231855; border-color:var(--bad); }
+  .sumline { margin-top:10px; font-size:13px; color:var(--muted); }
+  .sumline b.bad { color:var(--bad); }
+  .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top:4px; }
+  button { padding:9px 18px; border-radius:8px; border:1px solid #0b3d2e; background:#0b3d2e; color:#fff; font-size:14px; cursor:pointer; }
+  button.ghost { background:#fff; color:#0b3d2e; }
+  button:disabled { opacity:.55; cursor:default; }
+  #status { min-height: 26px; font-size:13.5px; margin: 10px 0 2px; color:var(--muted); }
+  #status .spin { display:inline-block; width:13px; height:13px; border:2px solid #0b3d2e33; border-top-color:#0b3d2e; border-radius:50%; animation:sp 0.8s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .panel { border-radius:10px; padding:14px 16px; margin-top:10px; font-size:13.5px; display:none; }
+  .panel.ok { display:block; background:#eefaf1; border:1px solid #bfe6c9; }
+  .panel.failure { display:block; background:#fdf6e4; border:1px solid #ecd9a0; }
+  .panel.invalid { display:block; background:#f1f3f5; border:1px solid var(--line); }
+  .panel h3 { margin:0 0 8px; font-size:14.5px; }
+  .panel.ok h3 { color:var(--ok); } .panel.failure h3 { color:var(--warn); }
+  .prob { display:flex; gap:26px; flex-wrap:wrap; margin-bottom:10px; }
+  .prob .card { border:1px solid var(--line); border-radius:8px; padding:8px 14px; background:#fff; }
+  .prob .card .lab { font-size:12px; color:var(--muted); }
+  .prob .card .val { font-size:19px; font-weight:600; }
+  .qual-yes { color:var(--ok); } .qual-no { color:var(--bad); }
+  .bar { height:9px; border-radius:5px; background:#e5e9ee; position:relative; min-width:120px; }
+  .bar i { position:absolute; top:0; bottom:0; border-radius:5px; }
+  .bar i.pos { left:50%; background:#2f9e63; }
+  .bar i.neg { right:50%; background:#d05a4e; }
+  .bar span.mid { position:absolute; left:50%; top:-2px; bottom:-2px; width:1px; background:#b6bec8; }
+  .pos-txt { color:var(--ok); } .neg-txt { color:var(--bad); }
+  .kv { margin:4px 0; }
+  .kv b { font-weight:600; }
+  .errline { margin-top:8px; padding-top:8px; border-top:1px dashed var(--line); color:var(--muted); font-size:12.5px; }
+  .note { font-size:12.5px; color:var(--muted); margin-top:8px; line-height:1.65; }
+  details { margin-top:12px; font-size:12.5px; }
+  details summary { cursor:pointer; color:var(--muted); }
+  details table { margin-top:6px; }
+  details th, details td { font-size:12.5px; padding:4px 6px; }
+  code { background:#eef1f4; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>合格概率归因（Shapley）</h1>
+  <p id="metaLine">质检模型加载中…</p>
+  <nav>原试配仍可使用：<a href="/">← 回到配方试配筛选</a></nav>
+</header>
+<main>
+  <section>
+    <h2>1. 录入调整前 / 调整后的配方（各 4 料整数克数，总重均为 1000 克）</h2>
+    <table id="grid">
+      <thead>
+        <tr><th>原料</th><th>调整前（克）</th><th>调整后（克）</th><th>用量变化（克）</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="sumline" id="sumLineOrig"></div>
+    <div class="sumline" id="sumLineAdj"></div>
+    <div class="btns">
+      <button id="calcBtn">计算归因</button>
+      <button class="ghost" id="sampleBtn">载入示例配方</button>
+    </div>
+    <div class="note">
+      归因方法：对 4 料每个子集，固定子集内原料的<b>调整后</b>用量，其余原料按<b>调整前</b>配方比例补齐 1000 克；
+      参考剩余量全为零时均分余量，取整余克按固定规则（最大余数法；余量相同取下标靠前者；参考量为 0 的原料不得余克）分配。
+      用原随机森林对每份中间配方的 float32 比例推理，按 Shapley 值给出各原料的有符号贡献。
+      调整配方后旧报告会立即撤下，迟到的旧响应不会恢复。
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 归因报告</h2>
+    <div id="status">尚未计算。</div>
+
+    <div class="panel ok" id="panelOk">
+      <h3>归因结果（原随机森林，float32 比例推理）</h3>
+      <div class="prob">
+        <div class="card"><div class="lab">调整前合格概率</div><div class="val"><span id="okProbOrig"></span> <span id="okQualOrig"></span></div></div>
+        <div class="card"><div class="lab">调整后合格概率</div><div class="val"><span id="okProbAdj"></span> <span id="okQualAdj"></span></div></div>
+        <div class="card"><div class="lab">实际概率变化</div><div class="val" id="okDiff"></div></div>
+      </div>
+      <table>
+        <thead><tr><th>原料</th><th>调整前</th><th>调整后</th><th>用量变化</th><th>Shapley 贡献</th><th>贡献大小</th></tr></thead>
+        <tbody id="okRows"></tbody>
+      </table>
+      <div class="kv" style="margin-top:10px">建议优先复核：<b id="okPriority"></b></div>
+      <div class="errline">
+        贡献和：<b id="okSum"></b>　实际概率差：<b id="okActual"></b>　误差（贡献和 − 实际差）：<b id="okError"></b>
+      </div>
+      <details>
+        <summary>查看 16 份中间配方与概率（可复算）</summary>
+        <table>
+          <thead><tr><th>固定为调整后用量的原料</th><th>中间配方（克）</th><th>合格概率</th></tr></thead>
+          <tbody id="okIntermediates"></tbody>
+        </table>
+        <div class="note">固定项为空集的配方即调整前配方；固定项为全部 4 料时即调整后配方。</div>
+      </details>
+    </div>
+
+    <div class="panel invalid" id="panelInvalid">
+      <h3>输入不合法（未生成归因报告）</h3>
+      <div class="kv" id="invalidReason"></div>
+    </div>
+
+    <div class="panel failure" id="panelFailure">
+      <h3>归因计算失败（未生成报告）</h3>
+      <div class="kv" id="failureReason"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const TOTAL = 1000;
+let featureNames = ["原料1","原料2","原料3","原料4"];
+let sample = null;
+
+// ---- 结果撤回机制：epoch + AbortController ----
+// 任何输入修改都会令 epoch 递增、中止在途请求并立即清空旧归因；
+// 迟到的响应若 epoch 已过期则直接丢弃，绝不恢复旧报告。
+let epoch = 0;
+let inflight = null;
+
+const $ = id => document.getElementById(id);
+
+function buildGrid() {
+  const tbody = document.querySelector("#grid tbody");
+  tbody.innerHTML = "";
+  for (let i = 0; i < 4; i++) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td>${featureNames[i]}</td>` +
+      `<td><input type="number" id="orig${i}" min="0" max="${TOTAL}" step="1"></td>` +
+      `<td><input type="number" id="adj${i}" min="0" max="${TOTAL}" step="1"></td>` +
+      `<td id="chg${i}">—</td>`;
+    tbody.appendChild(tr);
+  }
+  if (!tbody.dataset.bound) {
+    tbody.dataset.bound = "1";
+    tbody.addEventListener("input", onUserEdit);
+    tbody.addEventListener("change", onUserEdit);
+  }
+}
+
+function onUserEdit() {
+  epoch++;                       // 使在途与未来的迟到结果全部失效
+  if (inflight) { inflight.abort(); inflight = null; }
+  $("calcBtn").disabled = false;
+  hidePanels();
+  $("status").textContent = "配方已修改，旧归因报告已撤下。请重新计算。";
+  updateSums();
+  updateChanges();
+}
+
+function readNum(id) {
+  const s = $(id).value.trim();
+  const v = s === "" ? NaN : Number(s);
+  return Number.isInteger(v) ? v : NaN;
+}
+
+function readFormula(prefix) {
+  return [0,1,2,3].map(i => readNum(prefix + i));
+}
+
+function updateSums() {
+  for (const [prefix, lineId] of [["orig", "sumLineOrig"], ["adj", "sumLineAdj"]]) {
+    let sum = 0, bad = false;
+    for (let i = 0; i < 4; i++) {
+      const el = $(prefix + i);
+      const v = readNum(prefix + i);
+      if (!Number.isInteger(v) || v < 0 || v > TOTAL) { bad = true; el.classList.add("invalid"); }
+      else { el.classList.remove("invalid"); sum += v; }
+    }
+    const label = prefix === "orig" ? "调整前" : "调整后";
+    $(lineId).innerHTML = bad
+      ? `${label}配方存在非法数值。`
+      : (sum === TOTAL ? `${label}总重：<b>${sum}</b> 克 ✓` : `${label}总重：<b class="bad">${sum}</b> 克（须等于 ${TOTAL}）`);
+  }
+}
+
+function updateChanges() {
+  for (let i = 0; i < 4; i++) {
+    const a = readNum("orig" + i), b = readNum("adj" + i);
+    const cell = $("chg" + i);
+    if (!cell) continue;
+    if (!Number.isInteger(a) || !Number.isInteger(b)) { cell.textContent = "—"; cell.className = ""; continue; }
+    const d = b - a;
+    cell.textContent = d === 0 ? "—" : (d > 0 ? "+" : "") + d;
+    cell.className = d > 0 ? "pos-txt" : (d < 0 ? "neg-txt" : "");
+  }
+}
+
+function validateForm(original, adjusted) {
+  const errs = [];
+  for (const [label, arr] of [["调整前", original], ["调整后", adjusted]]) {
+    if (arr.some(v => !Number.isInteger(v) || v < 0 || v > TOTAL)) {
+      errs.push(`${label}配方必须是 4 个 0–${TOTAL} 的整数克数`);
+      continue;
+    }
+    if (arr.reduce((a, b) => a + b, 0) !== TOTAL) {
+      errs.push(`${label}总克数必须等于 ${TOTAL}（当前 ${arr.reduce((a, b) => a + b, 0)}）`);
+    }
+  }
+  return errs;
+}
+
+function fillForm(s) {
+  for (let i = 0; i < 4; i++) {
+    $("orig"+i).value = s.original[i];
+    $("adj"+i).value = s.adjusted[i];
+  }
+  onUserEdit();
+}
+
+function hidePanels() {
+  for (const id of ["panelOk","panelInvalid","panelFailure"])
+    $(id).style.display = "none";
+}
+function showPanel(id) { hidePanels(); $(id).style.display = "block"; }
+
+function pct(v) { return (v * 100).toFixed(2) + "%"; }
+function signed(v) { return (v > 0 ? "+" : "") + v; }
+
+function renderReport(d) {
+  // 只有 status === "ok" 且字段完整时才渲染报告，避免任何残缺/非法数据成报告。
+  const pri = d && d.priority_index;
+  const goodContrib = Array.isArray(d && d.contributions) && d.contributions.length === 4
+    && d.contributions.every(c => c && Number.isFinite(c.contribution) && Number.isFinite(c.delta)
+        && typeof c.name === "string" && Number.isInteger(c.original) && Number.isInteger(c.adjusted));
+  const goodInter = Array.isArray(d && d.intermediates) && d.intermediates.every(r => r
+    && Array.isArray(r.subset) && r.subset.every(i => Number.isInteger(i) && i >= 0 && i < 4)
+    && Array.isArray(r.grams) && r.grams.length === 4 && r.grams.every(Number.isInteger)
+    && Number.isFinite(r.probability));
+  if (!d || d.status !== "ok" || !goodContrib || !goodInter
+      || !Number.isInteger(pri) || pri < 0 || pri >= 4
+      || !Number.isFinite(d.original_probability) || !Number.isFinite(d.adjusted_probability)
+      || !Number.isFinite(d.difference) || !Number.isFinite(d.contribution_sum)
+      || !Number.isFinite(d.error)) {
+    $("failureReason").textContent = (d && d.reason) || "服务返回的数据不完整。";
+    showPanel("panelFailure");
+    $("status").textContent = "归因失败，未生成报告。";
+    return;
+  }
+  $("okProbOrig").textContent = pct(d.original_probability);
+  $("okProbAdj").textContent = pct(d.adjusted_probability);
+  const q0 = d.original_probability >= 0.7 - 1e-9, q1 = d.adjusted_probability >= 0.7 - 1e-9;
+  $("okQualOrig").textContent = q0 ? "合格" : "不合格";
+  $("okQualOrig").className = q0 ? "qual-yes" : "qual-no";
+  $("okQualAdj").textContent = q1 ? "合格" : "不合格";
+  $("okQualAdj").className = q1 ? "qual-yes" : "qual-no";
+  const diff = d.difference;
+  $("okDiff").textContent = signed((diff * 100).toFixed(2)) + " 个百分点";
+  $("okDiff").className = diff > 0 ? "pos-txt" : (diff < 0 ? "neg-txt" : "");
+
+  const maxAbs = Math.max(1e-12, ...d.contributions.map(c => Math.abs(c.contribution)));
+  $("okRows").innerHTML = d.contributions.map(c => {
+    const cp = c.contribution * 100;
+    const w = Math.abs(cp) / (maxAbs * 100) * 50;      // 半宽 50%
+    const bar = cp >= 0
+      ? `<i class="pos" style="width:${w}%"></i><span class="mid"></span>`
+      : `<i class="neg" style="width:${w}%"></i><span class="mid"></span>`;
+    const cls = cp > 0 ? "pos-txt" : (cp < 0 ? "neg-txt" : "");
+    return `<tr><td>${c.name}</td><td>${c.original}</td><td><b>${c.adjusted}</b></td>` +
+      `<td class="${c.delta > 0 ? "pos-txt" : (c.delta < 0 ? "neg-txt" : "")}">${c.delta === 0 ? "—" : signed(c.delta)}</td>` +
+      `<td class="${cls}"><b>${signed(cp.toFixed(2))}</b> pp</td>` +
+      `<td><div class="bar">${bar}</div></td></tr>`;
+  }).join("");
+
+  $("okPriority").textContent = `${d.priority_name}（|贡献| 最大：${(Math.abs(d.contributions[d.priority_index].contribution) * 100).toFixed(2)} 个百分点）`;
+  $("okSum").textContent = d.contribution_sum.toPrecision(12);
+  $("okActual").textContent = d.difference.toPrecision(12);
+  $("okError").textContent = d.error.toExponential(2);
+
+  $("okIntermediates").innerHTML = (d.intermediates || []).map(row => {
+    const label = row.subset.length === 0 ? "∅（调整前）"
+      : row.subset.map(i => d.contributions[i].name).join("、");
+    return `<tr><td>${label}</td><td>${row.grams.join(" / ")}</td><td>${(row.probability * 100).toFixed(2)}%</td></tr>`;
+  }).join("");
+
+  showPanel("panelOk");
+  $("status").textContent = "归因完成。";
+}
+
+async function compute() {
+  const my = ++epoch;                 // 本次计算的序号；任何修改都会使其过期
+  if (inflight) { inflight.abort(); inflight = null; }
+  hidePanels();
+  const original = readFormula("orig"), adjusted = readFormula("adj");
+  const errs = validateForm(original, adjusted);
+  if (errs.length) {                  // 前端即拒绝：不请求、不出报告
+    $("invalidReason").textContent = errs.join("；");
+    showPanel("panelInvalid");
+    $("status").textContent = "输入不合法，未生成归因报告。";
+    return;
+  }
+  inflight = new AbortController();
+  const signal = inflight.signal;
+  $("status").innerHTML = '<span class="spin"></span>归因计算中…（期间修改配方将作废旧结果）';
+  $("calcBtn").disabled = true;
+  let data;
+  try {
+    const resp = await fetch("/api/attribution", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ original, adjusted }),
+      signal,
+    });
+    data = await resp.json();
+  } catch (e) {
+    if (my !== epoch) return;          // 已被修改/更新的请求取代
+    $("calcBtn").disabled = false;
+    if (e.name === "AbortError") return;   // 修改触发的中止，onUserEdit 已处理
+    $("failureReason").textContent = "请求失败：" + e.message;
+    showPanel("panelFailure");
+    $("status").textContent = "归因失败，未生成报告。";
+    return;
+  }
+  $("calcBtn").disabled = false;
+  if (my !== epoch) return;            // 迟到结果：丢弃，不恢复
+  renderReport(data);
+}
+
+async function boot() {
+  buildGrid();
+  const [meta, smp] = await Promise.all([
+    fetch("/api/meta").then(r => r.json()),
+    fetch("/api/attribution/sample").then(r => r.json()),
+  ]);
+  sample = smp;
+  featureNames = meta.feature_names;
+  buildGrid();
+  $("metaLine").textContent =
+    `质检模型：随机森林 ${meta.n_trees} 棵树 / 深度 ≤ ${meta.max_depth}，固定种子 ${meta.train_seed} 训练；` +
+    `合格阈值 概率 ≥ ${meta.proba_threshold}；总重 ${meta.total_grams} 克。`;
+  fillForm(sample);
+  $("calcBtn").onclick = compute;
+  $("sampleBtn").onclick = () => fillForm(sample);
+}
+boot().catch(e => { $("status").textContent = "初始化失败：" + e.message; });
+</script>
+</body>
+</html>
